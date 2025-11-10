@@ -5,3 +5,4 @@ __pycache__
 yt-dlp.exe
 /logs
 /models
+/downloads

@@ -274,7 +274,7 @@ class WinstonCog(CogModule):
 			]
 		)
 
-		if len(transcript) <= 2000:
+		if len(transcript) <= 1000:
 			embed.add_field(name="Transcript", value=transcript, inline=False)
 			await job.interaction.channel.send(
 				content=f"{job.interaction.user.mention} The transcript is ready.",
