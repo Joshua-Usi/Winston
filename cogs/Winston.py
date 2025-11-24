@@ -1,4 +1,5 @@
 import re, json, discord, asyncio, os, base64, time
+from abc import ABC, abstractmethod
 from utils.CogModule import CogModule
 from discord.ext import commands, tasks
 from urllib.parse import urlparse, parse_qs
@@ -8,11 +9,136 @@ import utils.utils as utils
 
 YOUTUBE_REGEX = re.compile(r"^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$")
 
+
+class MediaSourceStrategy(ABC):
+	id: str
+
+	@abstractmethod
+	def can_handle(self, url: str) -> bool:
+		...
+
+	@abstractmethod
+	def create_job(self, interaction: discord.Interaction, url: str) -> "TranscriptionJob | None":
+		...
+
+	@abstractmethod
+	def build_ytdlp_cmd(self, job: "TranscriptionJob", audio_path: str) -> list[str]:
+		...
+
+
 class TranscriptionJob:
-	def __init__(self, interaction: discord.Interaction, video_id: str, clean_url: str):
+	def __init__(
+		self,
+		interaction: discord.Interaction,
+		source: MediaSourceStrategy,
+		media_id: str,
+		canonical_url: str,
+		thumbnail_url: str | None = None,
+	):
 		self.interaction = interaction
-		self.video_id = video_id
-		self.clean_url = clean_url
+		self.source = source
+		self.media_id = media_id
+		self.canonical_url = canonical_url
+		self.thumbnail_url = thumbnail_url
+
+
+class YouTubeSource(MediaSourceStrategy):
+	id = "youtube"
+
+	def can_handle(self, url: str) -> bool:
+		return bool(YOUTUBE_REGEX.match(url))
+
+	def _extract_video_id(self, url: str) -> str | None:
+		parsed = urlparse(url)
+		if parsed.netloc.endswith("youtu.be"):
+			return parsed.path.strip("/")
+		if "youtube.com" in parsed.netloc:
+			query = parse_qs(parsed.query)
+			if "v" in query:
+				return query["v"][0]
+			shorts_match = re.search(r"youtube\.com/shorts/([a-zA-Z0-9_-]{11})", url)
+			if shorts_match:
+				return shorts_match.group(1)
+		match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
+		return match.group(1) if match else None
+
+	def create_job(self, interaction: discord.Interaction, url: str) -> TranscriptionJob | None:
+		video_id = self._extract_video_id(url)
+		if not video_id:
+			return None
+
+		clean_url = f"https://www.youtube.com/watch?v={video_id}"
+		thumb = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+		return TranscriptionJob(
+			interaction=interaction,
+			source=self,
+			media_id=video_id,
+			canonical_url=clean_url,
+			thumbnail_url=thumb,
+		)
+
+	def build_ytdlp_cmd(self, job: TranscriptionJob, audio_path: str) -> list[str]:
+		ytdlp_path = os.path.join(os.getcwd(), "yt-dlp.exe")
+		return [
+			ytdlp_path,
+			"-f", "bestaudio",
+			"--extract-audio",
+			"--audio-format", "mp3",
+			"-o", audio_path,
+			job.canonical_url,
+		]
+
+
+class RedditSource(MediaSourceStrategy):
+	id = "reddit"
+
+	def can_handle(self, url: str) -> bool:
+		parsed = urlparse(url)
+		host = parsed.netloc.lower()
+		return host.endswith("reddit.com") or host.endswith("v.redd.it")
+
+	def _extract_media_id(self, url: str) -> str:
+		parsed = urlparse(url)
+		path = parsed.path or ""
+		parts = [p for p in path.split("/") if p]
+
+		# v.redd.it/<id>
+		if parsed.netloc.lower().endswith("v.redd.it") and parts:
+			return f"reddit_{parts[0]}"
+
+		# reddit.com/r/<sub>/comments/<post_id>/...
+		if "comments" in parts:
+			idx = parts.index("comments")
+			if idx + 1 < len(parts):
+				return f"reddit_{parts[idx + 1]}"
+
+		# Fallback: sanitised path
+		sanitised = re.sub(r"\W+", "_", path.strip("/")) or "reddit"
+		return f"reddit_{sanitised}"
+
+	def create_job(self, interaction: discord.Interaction, url: str) -> TranscriptionJob | None:
+		media_id = self._extract_media_id(url)
+		canonical_url = url  # keep as provided; yt-dlp can handle it directly
+		thumbnail_url = None  # could be enhanced later via metadata probe
+		return TranscriptionJob(
+			interaction=interaction,
+			source=self,
+			media_id=media_id,
+			canonical_url=canonical_url,
+			thumbnail_url=thumbnail_url,
+		)
+
+	def build_ytdlp_cmd(self, job: TranscriptionJob, audio_path: str) -> list[str]:
+		ytdlp_path = os.path.join(os.getcwd(), "yt-dlp.exe")
+		return [
+			ytdlp_path,
+			"-f", "bestaudio",
+			"--extract-audio",
+			"--audio-format", "mp3",
+			"-o", audio_path,
+			job.canonical_url,
+		]
+
 
 class WinstonCog(CogModule):
 	"""Main winston orchestrator"""
@@ -20,9 +146,15 @@ class WinstonCog(CogModule):
 		super().__init__(bot)
 		self.bot = bot
 
+		# Supported media sources (strategies)
+		self.sources: list[MediaSourceStrategy] = [
+			YouTubeSource(),
+			RedditSource(),
+		]
+
 		self.queue = asyncio.Queue()
-		self.pending_jobs = []
-		self.active_jobs = []
+		self.pending_jobs: list[TranscriptionJob] = []
+		self.active_jobs: list[TranscriptionJob] = []
 		self.worker.start()
 
 		self.stt = STTClient("127.0.0.1", utils.get_free_port(), "/inference", {
@@ -49,48 +181,52 @@ class WinstonCog(CogModule):
 
 		return embed
 
-	@discord.app_commands.command(name="transcribe", description="Transcribe a YouTube video link")
-	@discord.app_commands.describe(link="The YouTube video URL")
+	@discord.app_commands.command(name="transcribe", description="Transcribe a video link (YouTube, Reddit)")
+	@discord.app_commands.describe(link="The video URL")
 	async def transcribe(self, interaction: discord.Interaction, link: str):
-		if not YOUTUBE_REGEX.match(link):
+		source: MediaSourceStrategy | None = None
+		for s in self.sources:
+			if s.can_handle(link):
+				source = s
+				break
+
+		if not source:
 			embed = self.build_embed(
-				"❌ Invalid YouTube Link",
+				"❌ Unsupported Link",
 				discord.Color.red(),
 				lambda e: e.add_field(
 					name="Error",
-					value="That doesn’t look like a valid YouTube video link.\nPlease provide a proper `youtube.com` or `youtu.be` URL."
+					value="That link doesn't look like a supported video source.\n"
+					      "Currently supported: **YouTube**, **Reddit (v.redd.it / reddit.com)**."
 				)
 			)
 			await interaction.response.send_message(embed=embed, ephemeral=False)
 			return
 
-		video_id = self.extract_video_id(link)
-		if not video_id:
+		job = source.create_job(interaction, link)
+		if not job:
 			embed = self.build_embed(
-				"❌ Couldn’t Extract Video ID",
+				"❌ Couldn’t Prepare Media",
 				discord.Color.red(),
 				lambda e: e.add_field(
 					name="Error",
-					value="That YouTube link seems malformed or missing a video ID."
+					value="The link seems malformed or missing required media information."
 				)
 			)
 			await interaction.response.send_message(embed=embed, ephemeral=False)
 			return
-
-		clean_url = f"https://www.youtube.com/watch?v={video_id}"
 
 		embed = self.build_embed(
 			"🎙️ Transcribing...",
 			discord.Color.blurple(),
 			lambda e: [
-				e.set_thumbnail(url=f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"),
-				e.add_field(name="Source", value=f"[Click to open video]({clean_url})", inline=False)
+				e.set_thumbnail(url=job.thumbnail_url) if job.thumbnail_url else None,
+				e.add_field(name="Source", value=f"[Click to open source]({job.canonical_url})", inline=False)
 			]
 		)
 
 		await interaction.response.send_message(embed=embed, ephemeral=False)
 
-		job = TranscriptionJob(interaction, video_id, clean_url)
 		self.pending_jobs.append(job)
 		await self.queue.put(job)
 
@@ -117,7 +253,7 @@ class WinstonCog(CogModule):
 				return f"**No {title.lower()} jobs.**"
 			lines = []
 			for i, job in enumerate(jobs, 1):
-				lines.append(f"**{i}.** [Video]({job.clean_url}) • {job.interaction.user.mention}")
+				lines.append(f"**{i}.** [Source]({job.canonical_url}) • {job.interaction.user.mention}")
 			return "\n".join(lines)
 
 		embed = self.build_embed(
@@ -131,49 +267,24 @@ class WinstonCog(CogModule):
 
 		await interaction.response.send_message(embed=embed, ephemeral=False)
 
-
-	@staticmethod
-	def extract_video_id(url: str) -> str | None:
-		parsed = urlparse(url)
-		if parsed.netloc.endswith("youtu.be"):
-			return parsed.path.strip("/")
-		if "youtube.com" in parsed.netloc:
-			query = parse_qs(parsed.query)
-			if "v" in query:
-				return query["v"][0]
-			shorts_match = re.search(r"youtube\.com/shorts/([a-zA-Z0-9_-]{11})", url)
-			if shorts_match:
-				return shorts_match.group(1)
-		match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
-		return match.group(1) if match else None
-
-
 	@tasks.loop(seconds=1)
 	async def worker(self):
 		if self.queue.empty():
 			return
 
-		job = await self.queue.get()
+		job: TranscriptionJob = await self.queue.get()
 		if job in self.pending_jobs:
 			self.pending_jobs.remove(job)
 		self.active_jobs.append(job)
 
 		start_time = time.perf_counter()  # ⏱️ start tracking
-		print(f"Starting transcription for {job.clean_url}")
+		print(f"Starting transcription for {job.canonical_url}")
 
-		# 🧱 Step 1: Download audio using yt_dlp
+		# 🧱 Step 1: Download audio using yt_dlp via strategy
 		os.makedirs("downloads", exist_ok=True)
-		audio_path = os.path.join("downloads", f"{job.video_id}.mp3")
+		audio_path = os.path.join("downloads", f"{job.media_id}.mp3")
 
-		ytdlp_path = os.path.join(os.getcwd(), "yt-dlp.exe")
-		ytdlp_cmd = [
-			ytdlp_path,
-			"-f", "bestaudio",
-			"--extract-audio",
-			"--audio-format", "mp3",
-			"-o", audio_path,
-			job.clean_url
-		]
+		ytdlp_cmd = job.source.build_ytdlp_cmd(job, audio_path)
 
 		process = await asyncio.create_subprocess_exec(
 			*ytdlp_cmd,
@@ -189,7 +300,7 @@ class WinstonCog(CogModule):
 				discord.Color.red(),
 				lambda e: e.add_field(
 					name="Error",
-					value="Could not download audio. The video might be private or blocked."
+					value="Could not download audio. The media might be private or blocked."
 				)
 			)
 			await job.interaction.channel.send(embed=embed)
@@ -199,7 +310,7 @@ class WinstonCog(CogModule):
 		print(f"Download complete → {audio_path}")
 
 		# 🎧 Step 2: Convert to mono 16 kHz WAV (Whisper-friendly)
-		wav_path = os.path.join("downloads", f"{job.video_id}_16k.wav")
+		wav_path = os.path.join("downloads", f"{job.media_id}_16k.wav")
 
 		ffmpeg_path = "ffmpeg"  # assumes ffmpeg.exe is in PATH
 		ffmpeg_cmd = [
@@ -259,7 +370,7 @@ class WinstonCog(CogModule):
 
 		# 🗒️ Step 6: Save transcript
 		os.makedirs("transcripts", exist_ok=True)
-		file_path = f"./transcripts/{job.video_id}.txt"
+		file_path = f"./transcripts/{job.media_id}.txt"
 		with open(file_path, "w", encoding="utf-8") as f:
 			f.write(transcript)
 
@@ -268,9 +379,9 @@ class WinstonCog(CogModule):
 			title="✅ Transcription Complete",
 			color=discord.Color.green(),
 			builder_fn=lambda e: [
-				e.add_field(name="Source", value=f"[Open video]({job.clean_url})", inline=False),
+				e.add_field(name="Source", value=f"[Open source]({job.canonical_url})", inline=False),
 				e.add_field(name="Time Taken", value=elapsed_str, inline=True),
-				e.set_thumbnail(url=f"https://img.youtube.com/vi/{job.video_id}/hqdefault.jpg")
+				e.set_thumbnail(url=job.thumbnail_url) if job.thumbnail_url else None
 			]
 		)
 
@@ -281,7 +392,7 @@ class WinstonCog(CogModule):
 				embed=embed
 			)
 		else:
-			file = discord.File(file_path, filename=f"{job.video_id}.txt")
+			file = discord.File(file_path, filename=f"{job.media_id}.txt")
 			await job.interaction.channel.send(
 				content=f"{job.interaction.user.mention} Here's the transcript file.",
 				embed=embed,
@@ -289,10 +400,11 @@ class WinstonCog(CogModule):
 			)
 
 		self.active_jobs.remove(job)
-		print(f"Finished transcription for {job.clean_url} in {elapsed_str}")
+		print(f"Finished transcription for {job.canonical_url} in {elapsed_str}")
 
 	def cog_unload(self):
 		self.worker.cancel()
+
 
 async def setup(bot: commands.Bot):
 	await bot.add_cog(WinstonCog(bot))
