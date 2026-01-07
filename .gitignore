@@ -6,3 +6,4 @@ yt-dlp.exe
 /logs
 /models
 /downloads
+.env
