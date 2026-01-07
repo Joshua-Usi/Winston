@@ -30,7 +30,7 @@ class TranscriptionJob:
 	def __init__(
 		self,
 		interaction: discord.Interaction,
-		source: MediaSourceStrategy,
+		source: "MediaSourceStrategy",
 		media_id: str,
 		canonical_url: str,
 		thumbnail_url: str | None = None,
@@ -152,19 +152,35 @@ class WinstonCog(CogModule):
 			RedditSource(),
 		]
 
+		# Job management
 		self.queue = asyncio.Queue()
 		self.pending_jobs: list[TranscriptionJob] = []
 		self.active_jobs: list[TranscriptionJob] = []
-		self.worker.start()
 
-		self.stt = STTClient("127.0.0.1", utils.get_free_port(), "/inference", {
+		# STT client lifecycle (lazy startup + warmup + idle shutdown)
+		self.stt: STTClient | None = None
+		self._stt_lock = asyncio.Lock()
+		self._stt_last_used: float | None = None
+		self._stt_busy: bool = False
+		self._stt_idle_timeout = 5 * 60      # 5 minutes
+		self._stt_warmup_seconds = 5         # backend warm-up
+
+		# Static STT configuration
+		self._stt_host = "127.0.0.1"
+		self._stt_endpoint = "/inference"
+		self._stt_config = {
 			"model": "./models/whisper-large-v3-turbo-Q8_0.bin",
 			"vad": "./models/vad-silero-v5.1.2.bin",
 			"prompt": "A conversation with Emma, Usi, Vedal and Neuro-sama:",
 			"hyperparameters": {
 				"beam_size": 8
 			}
-		}, "./logs/subprocesses")
+		}
+		self._stt_log_dir = "./logs/subprocesses"
+
+		# Background workers
+		self.worker.start()
+		self.stt_idle_task.start()
 
 	def build_embed(self, title: str, color: discord.Color, builder_fn=None):
 		"""
@@ -180,6 +196,35 @@ class WinstonCog(CogModule):
 			builder_fn(embed)
 
 		return embed
+
+	async def _ensure_stt_running(self):
+		"""
+		Lazily start the STT server if it's not running yet.
+		Waits a short warmup so the backend is ready to accept requests.
+		"""
+		async with self._stt_lock:
+			if self.stt is not None:
+				return
+
+			loop = asyncio.get_running_loop()
+
+			def create_client():
+				port = utils.get_free_port()
+				return STTClient(
+					self._stt_host,
+					port,
+					self._stt_endpoint,
+					self._stt_config,
+					self._stt_log_dir
+				)
+
+			# Run potentially blocking process spawn in a thread pool
+			self.stt = await loop.run_in_executor(None, create_client)
+			print("STT client started")
+
+		# Warm-up period so the backend process is actually ready
+		await asyncio.sleep(self._stt_warmup_seconds)
+		self._stt_last_used = time.perf_counter()
 
 	@discord.app_commands.command(name="transcribe", description="Transcribe a video link (YouTube, Reddit)")
 	@discord.app_commands.describe(link="The video URL")
@@ -345,12 +390,18 @@ class WinstonCog(CogModule):
 
 		print(f"Converted → {wav_path}")
 
+		# Ensure STT backend is up before we send audio
+		await self._ensure_stt_running()
+
 		# 🧬 Step 3: Encode to base64 for Whisper
 		with open(wav_path, "rb") as f:
 			audio_b64 = base64.b64encode(f.read()).decode()
 
 		# 🎙️ Step 4: Transcribe
 		try:
+			self._stt_busy = True
+			if not self.stt:
+				raise RuntimeError("STT client not initialised")
 			transcript = self.stt.transcribe(audio_b64)
 		except Exception as e:
 			print(f"Transcription failed: {e}")
@@ -362,6 +413,9 @@ class WinstonCog(CogModule):
 			await job.interaction.channel.send(embed=embed)
 			self.active_jobs.remove(job)
 			return
+		finally:
+			self._stt_busy = False
+			self._stt_last_used = time.perf_counter()
 
 		# 🕒 Step 5: Compute total time taken
 		elapsed = time.perf_counter() - start_time
@@ -402,8 +456,38 @@ class WinstonCog(CogModule):
 		self.active_jobs.remove(job)
 		print(f"Finished transcription for {job.canonical_url} in {elapsed_str}")
 
+	@tasks.loop(seconds=30)
+	async def stt_idle_task(self):
+		"""
+		Periodically check if the STT server has been idle long enough
+		and shut it down if so.
+		"""
+		if self.stt is None:
+			return
+		if self._stt_busy:
+			return
+		if self._stt_last_used is None:
+			return
+
+		now = time.perf_counter()
+		if now - self._stt_last_used < self._stt_idle_timeout:
+			return
+
+		async with self._stt_lock:
+			# Re-check inside the lock for safety
+			if self.stt is None or self._stt_busy:
+				return
+
+			print("Shutting down STT server due to inactivity...")
+			self.stt.close()
+			self.stt = None
+			self._stt_last_used = None
+
 	def cog_unload(self):
 		self.worker.cancel()
+		self.stt_idle_task.cancel()
+		if self.stt is not None:
+			self.stt.close()
 
 
 async def setup(bot: commands.Bot):
